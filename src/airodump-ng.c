@@ -74,6 +74,7 @@
 #include "osdep/common.h"
 #include "common.h"
 
+
 // libgcrypt thread callback definition for libgcrypt < 1.6.0
 #ifdef USE_GCRYPT
 	#if GCRYPT_VERSION_NUMBER < 0x010600
@@ -663,8 +664,11 @@ char usage[] =
 "      --wps                 : Display WPS information (if any)\n"
 "      --output-format\n"
 "                  <formats> : Output format. Possible values:\n"
-"                              pcap, ivs, csv, gps, kismet, netxml\n"
-"      --ignore-negative-one : Removes the message that says\n"
+"                              pcap, ivs, csv, gps, kismet, netxml"
+#ifdef HAVE_SQLITE
+", sqlite"
+#endif
+"\n      --ignore-negative-one : Removes the message that says\n"
 "                              fixed channel <interface>: -1\n"
 "      --write-interval\n"
 "                  <seconds> : Output file(s) write interval in seconds\n"
@@ -689,6 +693,7 @@ char usage[] =
 "                    0       : FIFO (default)\n"
 "                    1       : Round Robin\n"
 "                    2       : Hop on last\n"
+"                    3       : Static (no switching)\n"
 "      -s                    : same as --cswitch\n"
 "\n"
 "      --help                : Displays this usage screen\n"
@@ -827,6 +832,9 @@ int dump_initialize( char *prefix, int ivs_only )
     int i, ofn_len;
     FILE *f;
     char * ofn = NULL;
+    
+    int sql_res;
+    char *sql_stmt, *sql_err;
 
 
     /* If you only want to see what happening, send all data to /dev/null */
@@ -866,6 +874,38 @@ int dump_initialize( char *prefix, int ivs_only )
 
     G.prefix = (char *) malloc(strlen(prefix) + 1);
     memcpy(G.prefix, prefix, strlen(prefix) + 1);
+    
+    /* create the output SQLite database */
+        if (G.output_format_sqlite) {
+	    memset(ofn, 0, ofn_len);
+	    snprintf(ofn,  ofn_len, "%s-%02d.%s", prefix, G.f_index, AIRODUMP_NG_SQLITE_EXT);
+	    
+	    sql_res = sqlite3_open(ofn, &G.f_sqlite);
+	    if (sql_res != SQLITE_OK) {
+		perror("sqlite3_open failed");
+		fprintf(stderr, "Could not open \"%s\". Error (%d)\n", ofn, sql_res);
+		free(ofn);
+		return( 1 );
+	    }
+	    else{
+		sql_stmt = "CREATE TABLE recording("		\
+		    "ADDRESS		CHAR(17)  NOT NULL,"	\
+		    "TIME			DATETIME  NOT NULL,"	\
+		    "CHANNEL		INT  NOT NULL,"			\
+		    "RSSI			INT  NOT NULL,"			\
+		    "PRIMARY KEY (ADDRESS, TIME));"         \
+		    "CREATE TABLE probe("                   \
+		    "ADDRESS		CHAR(17)  NOT NULL,"    \
+		    "SSID           CHAR(32)  NOT NULL,"    \
+		    "PRIMARY KEY (ADDRESS, SSID));";
+		sql_res = sqlite3_exec(G.f_sqlite, sql_stmt, NULL, 0, &sql_err);
+		if (sql_res != SQLITE_OK) {
+		    fprintf(stderr, "SQL error: %s\n", sql_err);
+		    sqlite3_free(sql_err);
+		    return(1);
+		}		
+	    }
+	}
 
     /* create the output CSV file */
 
@@ -3743,6 +3783,105 @@ char * format_text_for_csv( const unsigned char * input, int len)
 	return ret;
 }
 
+
+int dump_write_sqlite( void )
+{
+
+    struct AP_info *ap_cur;
+    struct ST_info *st_cur;
+    struct tm * ltime;
+    char *sql_stmt, *sql_err;
+    char ssid[64];
+    int sql_res, channel;
+    int i, j;
+    
+    st_cur = G.st_1st;
+    
+   
+    sqlite3_exec(G.f_sqlite, "BEGIN TRANSACTION", NULL, NULL, &sql_err);
+    sql_stmt = (char *)malloc(1024);
+    
+    while(st_cur != NULL)
+	{
+	    
+	    ap_cur = st_cur->base;
+	    
+	    if(ap_cur->nb_pkt < 2)
+		{
+		    st_cur = st_cur->next;
+		    continue;
+		}
+	    
+	    ltime = localtime(&st_cur->tlast);
+	    
+	    if(!memcmp(ap_cur->bssid, BROADCAST, 6)){
+			channel = 0;
+		}
+		else{
+			channel = ap_cur->channel;
+		}
+	    
+	    sprintf(sql_stmt, "INSERT OR IGNORE INTO recording (ADDRESS, TIME, CHANNEL, RSSI) VALUES ('%02X:%02X:%02X:%02X:%02X:%02X', '%04d-%02d-%02d %02d:%02d:%02d', %d, %3d);",
+		     st_cur->stmac[0], st_cur->stmac[1],
+		     st_cur->stmac[2], st_cur->stmac[3],
+		     st_cur->stmac[4], st_cur->stmac[5], 
+		     
+		     1900 + ltime->tm_year, 1 + ltime->tm_mon,
+		     ltime->tm_mday, ltime->tm_hour,
+		     ltime->tm_min,  ltime->tm_sec,
+		     channel, st_cur->power);
+	    
+	    sql_res = sqlite3_exec(G.f_sqlite, sql_stmt, NULL, 0, &sql_err);
+	    if (sql_res != SQLITE_OK) {
+		fprintf( stderr, "SQL error: %s\n", sql_err);
+		sqlite3_free(sql_err);
+	    }
+	    
+	    
+	    memset(ssid, 0, sizeof(ssid));
+	    
+	    for(i = 0; i < NB_PRB; i++)
+		{
+		    // Iterate the SSID ring buffer
+		    if(st_cur->probes[i][0] == '\0')
+				continue;
+		    
+		    for(j = 0; j < st_cur->ssid_length[i]; j++)
+			{
+			    snprintf(ssid + j, sizeof(ssid) - 1 - j, "%c", st_cur->probes[i][j]);
+			}
+		    
+		    // SQL interaction
+		    sprintf(sql_stmt, "INSERT OR IGNORE INTO probe (ADDRESS, SSID) VALUES ('%02X:%02X:%02X:%02X:%02X:%02X', '%s');",
+			     st_cur->stmac[0], st_cur->stmac[1],
+			     st_cur->stmac[2], st_cur->stmac[3],
+			     st_cur->stmac[4], st_cur->stmac[5],
+			     ssid);
+		    		    	    
+		    sql_res = sqlite3_exec(G.f_sqlite, sql_stmt, NULL, 0, &sql_err);
+		    if (sql_res != SQLITE_OK) {
+				fprintf(stderr, "SQL error: %s\n", sql_err);
+				sqlite3_free(sql_err);
+		    }
+		}
+	    
+	    
+	    st_cur = st_cur->next;
+	}
+    
+    free(sql_stmt);
+    
+    sql_res = sqlite3_exec(G.f_sqlite, "END TRANSACTION", NULL, NULL, &sql_err);
+    if (sql_res != SQLITE_OK)
+	{
+	    fprintf( stderr, "SQL error: %s\n", sql_err);
+	    sqlite3_free(sql_err);
+	}
+    
+    return 0;
+}
+
+
 int dump_write_csv( void )
 {
     int i, n, probes_written;
@@ -5438,6 +5577,10 @@ void channel_hopper(struct wif *wi[], int if_num, int chan_count, pid_t parent)
         {
             chi=chi-(if_num - 1);
         }
+        else if(G.chswitch == 3)
+		{
+			continue;
+		}
 
         if(first)
         {
@@ -6263,6 +6406,9 @@ int main( int argc, char *argv[] )
     G.file_write_interval = 5; // Write file every 5 seconds by default
     G.maxsize_wps_seen  =  6;
     G.show_wps     = 0;
+#ifdef HAVE_SQLITE
+    G.output_format_sqlite = 0;
+#endif
 #ifdef HAVE_PCRE
     G.f_essid_regex = NULL;
 #endif
@@ -6557,7 +6703,7 @@ int main( int argc, char *argv[] )
 
             case 's':
 
-                if (atoi(optarg) > 2) {
+                if (atoi(optarg) > 3) {
                     goto usage;
                 }
                 if (G.chswitch != 0) {
@@ -6681,6 +6827,8 @@ int main( int argc, char *argv[] )
 						if (strncasecmp(output_format_string, "csv", 3) == 0
 							|| strncasecmp(output_format_string, "txt", 3) == 0) {
 							G.output_format_csv = 1;
+						} else if (strncasecmp(output_format_string, "sqlite", 6) == 0) {
+						        G.output_format_sqlite = 1;
 						} else if (strncasecmp(output_format_string, "pcap", 4) == 0
 							|| strncasecmp(output_format_string, "cap", 3) == 0) {
                             if (ivs_only) {
@@ -6707,12 +6855,12 @@ int main( int argc, char *argv[] )
 							|| strncasecmp(output_format_string, "kismet-newcore", 14) == 0
 							|| strncasecmp(output_format_string, "kismet_newcore", 14) == 0) {
 							G.output_format_kismet_netxml = 1;
-						} else if (strncasecmp(output_format_string, "default", 6) == 0) {
+						} else if (strncasecmp(output_format_string, "default", 7) == 0) {
 							G.output_format_pcap = 1;
 							G.output_format_csv = 1;
 							G.output_format_kismet_csv = 1;
 							G.output_format_kismet_netxml = 1;
-						} else if (strncasecmp(output_format_string, "none", 6) == 0) {
+						} else if (strncasecmp(output_format_string, "none", 4) == 0) {
 							G.output_format_pcap = 0;
 							G.output_format_csv = 0;
 							G.output_format_kismet_csv = 0;
@@ -7038,6 +7186,7 @@ usage:
             if (G. output_format_csv)  dump_write_csv();
             if (G.output_format_kismet_csv) dump_write_kismet_csv();
             if (G.output_format_kismet_netxml) dump_write_kismet_netxml();
+            if (G.output_format_sqlite)  dump_write_sqlite();
         }
 
         if( time( NULL ) - tt2 > 5 )
@@ -7354,11 +7503,19 @@ usage:
 
     for(i=0; i<G.num_cards; i++)
         wi_close(wi[i]);
+        
+    #ifdef HAVE_SQLITE
+        if (G.record_data && G.output_format_sqlite){
+			dump_write_sqlite();
+			sqlite3_close(G.f_sqlite);
+		}
+    #endif
 
     if (G.record_data) {
         if ( G. output_format_csv)  dump_write_csv();
         if ( G.output_format_kismet_csv) dump_write_kismet_csv();
         if ( G.output_format_kismet_netxml) dump_write_kismet_netxml();
+        if ( G.output_format_csv)  dump_write_csv();
 
         if ( G. output_format_csv || G.f_txt != NULL ) fclose( G.f_txt );
         if ( G.output_format_kismet_csv || G.f_kis != NULL ) fclose( G.f_kis );
